@@ -10,7 +10,7 @@ If there are unmeasured variables that provide constraints/opportunities for ind
 
 •	Non-temporal methods can only identify patterns, not mechanisms. I.e., If we find reciprocity/transitivity in the network it does not mean that individual behaviour is impacted/driven by reciprocity/transitivity.
 
-•	If we are asking about how social structures impact behaviour, then we should take a dynamic approach to SNA and use an additive and multiplicative random effects structure, otherwise we’re likely to get misleading results.
+•	If we are asking about how social structures impact behaviour, then we should take a dynamic approach to SNA and use edge-based models with additive and multiplicative random effects structure, otherwise we’re likely to get misleading results.
 
 
 **Abstract:**
