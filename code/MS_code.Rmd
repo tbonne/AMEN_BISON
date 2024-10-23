@@ -1,0 +1,1663 @@
+---
+title: "SNA when confounders are present"
+output: html_notebook
+---
+
+
+This notebook contains the code to test how edge based models perform when there is a confounding variable. A likely occurence with most SNA.
+
+Load libraries
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(rstan)
+library(brms)
+library(igraph)
+library(HDInterval)
+library(lubridate)
+library(reshape2)
+
+```
+
+
+
+# 1) Necessary functions
+
+### 1.0) Simulate data
+```{r}
+
+#Simulate some data
+
+sim_data_long <- function(nsim = 100, mean_contact=0.01,eff_groom_out=0,eff_groom_in=0,eff_groom_trans=0,eff_spatial=0, mem=10){
+  
+  #dataframe of observed grooming events
+  df_all_sim <- data.frame()
+  
+  plot_days = FALSE
+  
+  #number of individuals
+  unique_ID <- seq(1,20)
+  
+  #grooming out amount
+  grooming_prob <- rbeta(length(unique_ID), 5,2)
+  
+  #memory in the system (how much past social interactions impact current interactions)
+  memory = mem
+  
+  #Function to add a day to the list
+  add_element <- function(lst, element, max_size = memory) {
+    lst <- append(lst, list(element))
+    if (length(lst) > max_size) {
+      lst <- lst[-1]
+    }
+    return(lst)
+  }
+  
+  #create edge list of who can interact
+  edge_list_base<-expand.grid(unique_ID, unique_ID)
+  colnames(edge_list_base) <- c("From","To")
+  edge_list_base <- edge_list_base %>% filter(From!=To)
+  
+  
+  #mean overall prob of contact
+  mean_contact = mean_contact #background chance of grooming anyone!
+  eff_groom_out = eff_groom_out
+  eff_groom_in = eff_groom_in
+  eff_groom_trans = eff_groom_trans
+  
+  eff_groom_comm = 0.0
+  eff_mom_juve = 0.0
+  eff_closeness = 0.0
+  
+  #first day 
+  day.past <- edge_list_base
+  day.past$weight = rbinom(nrow(day.past), size=1, prob=0.1) #random who contacts who
+  day.past$day=0
+  
+  #generate history of interactions (x number of days) random?
+  history_interactions <- list()
+  history_interactions <- add_element(history_interactions, day.past)
+  
+  #take a look at initial social structure
+  #net_past <- create_network_past(history_interactions, sampleSize = 10)
+  #plot(net_past)
+  
+  #network layout
+  layout_init=NULL
+  
+  #simulate interactions (based on known/necessary mechanisms)
+  for (day in 1:nsim){
+    
+    #create a dataframe for a day
+    df_day <- data.frame()
+    
+    #get past measures (TO DO)
+    net_past <- create_network_past(history_interactions, sampleSize = 10)
+    #plot(net_past, edge.width = E(net_past)$weight) # take a look
+    
+    #loop through each focal ID
+    for (focal in unique_ID){
+      
+      #get the focals grooming out potential partners
+      edge_list_focal <- edge_list_base %>% filter(From == focal)
+      
+      #determine prob of interacting for each (prob ~ past + recip + trans + chance/error)
+      focal_dyad_probs <- vector()
+      
+      for(d in 1:nrow(edge_list_focal) ){
+        
+        #get the potential mechanisms (TO DO)
+        past_out_groom <- get_past_out_grooming(edge_list_focal[d,],net_past)
+        past_in_groom <- get_past_in_grooming(edge_list_focal[d,],net_past)
+        past_out_groom_trans <- get_past_trans_grooming(edge_list_focal[d,],net_past)
+        past_in_community <- get_past_in_community(edge_list_focal[d,],net_past)
+        
+        #hidden influences (missing variables)
+        sleepTree1 <- ifelse( (edge_list_focal[d,]$From <5) & (edge_list_focal[d,]$To < 5), eff_spatial, 0)
+        sleepTree2 <- ifelse( ((edge_list_focal[d,]$From >=5)&(edge_list_focal[d,]$From <=15)) & ((edge_list_focal[d,]$To >= 5)&(edge_list_focal[d,]$To <=15)), eff_spatial, 0)
+        sleepTree3 <- ifelse( (edge_list_focal[d,]$From >15) & (edge_list_focal[d,]$To > 15), eff_spatial, 0)
+        
+        #calculate the probability of interaction
+        prob = mean_contact + eff_groom_out * past_out_groom + eff_groom_in * past_in_groom  + eff_groom_trans * past_out_groom_trans + eff_groom_comm * past_in_community + sleepTree1 + sleepTree2 + sleepTree3
+        
+        #save prbs
+        focal_dyad_probs[length(focal_dyad_probs)+1] <- prob
+        
+      }
+      
+      #Distribute the focals grooming based on probs and grooming out amounts
+      focal_dyad_probs_sum_to_one <- focal_dyad_probs/sum(focal_dyad_probs)
+      edge_list_focal$weight <- as.vector(rmultinom(1, size = rbinom(length(focal_dyad_probs_sum_to_one),size=1,prob=grooming_prob[focal]), prob=focal_dyad_probs_sum_to_one))
+      
+      #save this edge list to the main dataframe
+      edge_list_focal$day <- day
+      df_day <- bind_rows(df_day, edge_list_focal)
+      
+    }
+    
+    #plot the day network
+    if(plot_days == TRUE){
+      df_day_plot <- df_day %>% filter(weight>0) 
+      g <- graph_from_data_frame(d = df_day_plot, directed = TRUE)
+      E(g)$weight <- df_day_plot$weight
+      g_simp <- simplify(g)
+      
+      if(is.null(layout_init) ){
+        layout_init = layout_with_fr(g)
+      }
+      plot(g_simp, edge.width = E(g_simp)$weight, edge.arrow.size=0.5, layout=layout_init, main=day )
+    }
+    
+    #after going through all IDs add this to the history of interactions
+    history_interactions <- add_element(history_interactions, df_day)
+    
+    #add to the overall output dataset
+    df_all_sim <- bind_rows(df_all_sim, df_day)
+  }
+  
+  #format the data
+  df_all_sim$Date <- ymd("2020-01-01") + days(df_all_sim$day)
+  df_all_sim$Scan <- df_all_sim$day
+  df_all_sim$Activity <- "Allo-Groomer"
+  df_all_sim$Troop <- "RBM"
+  
+  return (df_all_sim)
+}
+
+```
+
+
+### 1.1) Extract the past measures for each observation
+
+```{r}
+
+#get the past measures to help predict current behaviours
+
+extract_past_measures <- function(df_obs, past_lookup = days(10)){
+  
+  window_back = past_lookup
+  window_start = ymd("2020-01-10") #
+  window_end = ymd("2020-11-01") #
+  window_shift = days(1)
+  window_now = window_start + window_shift
+  
+  all_obs <- data.frame()
+  
+  while (window_now < window_end){
+    
+    #get the current scan
+    df.scans = df_obs %>% filter( (Date==window_now) )
+    
+    if(nrow(df.scans)>0){
+      
+      #each scan is used to get a list of who could have groomed, and who did groom.
+      y_values <- df.scans 
+      
+      #get history of interactions before the scans
+      df.past.scans = df_obs %>% filter( (Date<window_now) & (Date>=(window_now-window_back )  ) )
+      
+      #extract social structures from the history of interactions
+      x_values <- get_past_structures_para(df.past.scans, y_values) 
+      
+      #get env quality during the scans
+      #x_values$NDVI <-get_ndvi(start=(window_now-window_back),end=window_now) 
+      
+      #add the date
+      x_values$date = window_now
+      
+      #save the data
+      all_obs = bind_rows(all_obs, bind_cols(y_values,x_values))
+    }
+    
+    #move the window
+    window_now = window_now + window_shift
+    
+    #print(paste0("done one! ",window_now))
+    
+  }
+  
+  all_obs_unique_comb <- all_obs %>% distinct() 
+  
+  
+  #####
+  #format the data
+  #####
+  
+  df.edges.structure <- all_obs_unique_comb 
+  
+  #add dyad id
+  df.edges.structure$sr_indicator <- ifelse(df.edges.structure$From < df.edges.structure$To, 1,2)
+  
+  df.edges.structure$dyad <- ifelse(df.edges.structure$From < df.edges.structure$To, 
+                                    paste0(df.edges.structure$From,"_",df.edges.structure$To) ,
+                                    paste0(df.edges.structure$To,"_",df.edges.structure$From))
+  
+  df.edges.structure$dyad <- as.numeric(as.factor(df.edges.structure$dyad))
+  
+  
+  df.edges.structure$dyad_ordered <- paste0(df.edges.structure$From,"_",df.edges.structure$To)
+  #df.edges.structure$dyad <- as.numeric(as.factor(df.edges.structure$dyad))
+  
+  #add indicator if sender is a lower number compared to reciever 
+  #df.edges.structure$sr_indicator <- ifelse(df.edges.structure$From < df.edges.structure$To, 1,2)
+  
+  #scale everything
+  df.edges.structure$past_weight <- as.numeric(scale(df.edges.structure$past_weight))
+  df.edges.structure$past_reciprical <- as.numeric(scale(df.edges.structure$past_reciprical))
+  df.edges.structure$past_transitive <- as.numeric(scale(df.edges.structure$past_transitive))
+  
+  return(df.edges.structure)
+  
+}
+
+```
+
+
+
+### 1.2) Extraction functions
+
+```{r}
+
+
+create_network_past <- function(net_list, sampleSize = 1){
+  
+  # Combine all dataframes into a single dataframe
+  combined_df <- do.call(rbind, net_list)
+  
+  #remove zeros
+  combined_df <- combined_df %>% filter(weight>0)
+  
+  # Create the igraph object
+  g <- graph_from_data_frame(d = combined_df, directed = TRUE)
+  
+  # Adding weights
+  E(g)$weight <- combined_df$weight #/ sampleSize
+  
+  # Simplify the graph by summing the weights of repeated edges
+  g_simp <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = FALSE, edge.attr.comb = list(weight = "sum", "ignore"))
+  
+  return (g_simp)
+  
+}
+
+#####################
+# Check grooming out 
+#####################
+
+#Out grooming will be proportional: I.e., the proportion of out grooming to each partner will be retured
+get_past_out_grooming <- function(dyad,my_dyad_gnet) {
+  
+  # Get the edge ID between these two nodes
+  edge_id <- tryCatch({
+    get.edge.ids(my_dyad_gnet, c(as.character(dyad$From), as.character(dyad$To) ))
+  }, error = function(e) {
+    0  # Return NA if an error occurs
+  })
+  
+  # Retrieve the weight of this edge
+  edge_weight <- E(my_dyad_gnet)[edge_id]$weight
+  
+  #does the edge exist?
+  if(length(edge_weight)==0){
+    edge_weight=0
+  }
+  
+  #adjust for how much out-grooming there is in general
+  out<-strength(my_dyad_gnet, mode="out", weights = E(my_dyad_gnet)$weight)
+  node_name <- dyad$From
+  node_index <- which(V(my_dyad_gnet)$name == node_name)
+  out_focal<-out[node_index]
+  
+  past_out = 0
+  if(length(out_focal)>0){
+    if(out_focal>0){
+      past_out = edge_weight/out_focal
+    }
+  }
+  
+  return (past_out)
+  
+}
+
+#check how much the target has groomed the focal
+get_past_in_grooming <- function(dyad,my_dyad_gnet) {
+  
+  #check if the nodes exist in the network (if not, then no interactions)
+  if( !((dyad$To %in% V(my_dyad_gnet)$name) & (dyad$From %in% V(my_dyad_gnet)$name) ) ){
+    return (0)
+  }
+  
+  # Get the edge ID between these two nodes
+  edge_id <- tryCatch({
+    get.edge.ids(my_dyad_gnet, c(as.character(dyad$To), as.character(dyad$From) ))
+  }, error = function(e) {
+    0  # Return NA if an error occurs
+  })
+  
+  
+  # Retrieve the weight of this edge
+  edge_weight <- E(my_dyad_gnet)[edge_id]$weight
+  
+  #does the edge exist?
+  if(length(edge_weight)==0){
+    edge_weight=0
+  }
+  
+  
+  #adjust for how much in-grooming there is in general
+  in_strength<-strength(my_dyad_gnet, mode="in", weights = E(my_dyad_gnet)$weight)
+  
+  node_name <- dyad$From
+  node_index <- which(V(my_dyad_gnet)$name == node_name)
+  in_focal<-in_strength[node_index]
+  
+  
+  past_in = 0
+  if(length(in_focal)>0){
+    if(in_focal>0){
+      past_in = edge_weight/in_focal
+    }}
+  
+  return (past_in)
+  
+}
+
+
+
+get_past_trans_grooming <- function(dyad,my_dyad_gnet) {
+  
+  # Get all my friends
+  node_neighbors <- tryCatch({
+    
+    #get neighbours   
+    neigFrom<-neighbors(my_dyad_gnet, V(my_dyad_gnet)[V(my_dyad_gnet)$name==dyad$From], mode="out" )
+    neigTo<-neighbors(my_dyad_gnet, V(my_dyad_gnet)[V(my_dyad_gnet)$name==dyad$To], mode="out")
+    
+    # Get the names of the neighbours
+    neighborsFrom_names <- V(my_dyad_gnet)[neigFrom]$name
+    neighborsTo_names <- V(my_dyad_gnet)[neigTo]$name
+    
+    #get intersection of names
+    common_neighbors <- intersect(neighborsFrom_names, neighborsTo_names)
+    
+    common_neighbors
+    
+  }, error = function(e) {
+    NULL
+  })
+  
+  # Check if there are any common neighbors
+  if (length(node_neighbors) > 0) {
+    return(1)
+  } else {
+    return (0)
+  }
+  
+}
+
+
+get_past_closeness <- function(dyad, my_dyad_gnet){
+  
+  node1 <- V(my_dyad_gnet)[V(my_dyad_gnet)$name==dyad$From]
+  node2 <- V(my_dyad_gnet)[V(my_dyad_gnet)$name==dyad$To]
+  
+  # Calculate the shortest path distance between node1 and node2
+  sp_dist <- distances(my_dyad_gnet, v = node1, to = node2)
+  
+  # If the distance is infinite (i.e., they are in different components), return 0
+  if (!is.finite(sp_dist)) {
+    return(0)
+  }
+  
+  return(sp_dist)
+  
+}
+
+
+
+get_past_in_community <- function(dyad, my_dyad_gnet){
+  
+  wt <- cluster_walktrap(my_dyad_gnet)
+  
+  in_modu = sum(dyad$to %in% unlist(wt[wt$membership[which(V(my_dyad_gnet)$name==dyad$from)]]) )
+  
+  if(in_modu>1)in_modu=1
+  
+  return(in_modu)
+  
+}
+
+
+#grab the past social structures
+get_current_scans <- function(df.scans){
+  
+  #get unique scans
+  unique_scans = unique(df.scans$Scan)
+  
+  all_scans_in_day = data.frame()
+  
+  #for each scan
+  for(obs in unique_scans){
+    
+    #get scan
+    df.one.scan <- df.scans %>% filter(Scan == obs)
+    
+    #get who was seen together and who could have been seen together
+    df_seen <- get_who_was_seen(df.one.scan)
+    
+    #keep unique scan ID
+    df_seen$scanID <- obs
+    
+    #save data
+    all_scans_in_day <- bind_rows(all_scans_in_day, df_seen)
+    
+  }
+  
+  return (all_scans_in_day)  
+}
+
+
+
+
+#Modularity
+get_past_overall_module <- function(my_dyad_gnet){
+  
+  wt <- cluster_walktrap(my_dyad_gnet)
+  mod.wt <- modularity(my_dyad_gnet,wt$membership, weights = E(my_dyad_gnet)$weight)
+  
+  return (mod.wt)
+}
+
+
+
+get_network_from_scan <- function(df.past.scans, act="Allo-Groomer", troop="RBM", plot=FALSE){
+  
+  if (act == "Allo-Groomer"){
+    
+    df_edges <- df.past.scans %>% filter(weight>0) #bind_rows(df_edges_out,df_edges_in)
+    
+    
+    g.groom<-igraph::graph_from_data_frame(df_edges)
+    g.groom<-simplify(g.groom)
+    g.groom<- igraph::simplify(g.groom, remove.multiple = TRUE, remove.loops = FALSE, edge.attr.comb = list(weight = "sum", "ignore"))
+    E(g.groom)$weight
+    
+  } else {
+    df_edges <- df.past.scans %>% filter(Activity == act) %>% filter(Troop == troop) %>% select(From, To)
+    df_edges$weight <- 1
+    
+    g.groom<-igraph::graph_from_data_frame(df_edges)
+    g.groom<-simplify(g.groom)
+    E(g.groom)$weight
+    
+  }
+  
+  if(plot){plot(g.groom, edge.width=E(g.groom)$weight/10, edge.arrow.size=0.1)}
+  
+  return(g.groom)
+  
+}
+
+get_who_was_seen <- function(df.one.scan){
+  
+  #get individuals in the scan
+  individuals_grooming = df.one.scan
+  individuals_present = seq(1,10,1)
+  
+  #create a dataframe of who could have groomed
+  combinations<-expand.grid(From=individuals_present, To=individuals_present)
+  combinations <- combinations[combinations$From != combinations$To, ]
+  combinations<-combinations %>% distinct()
+  
+  #add in who did groom
+  combinations$weight <- 0
+  if(nrow(individuals_grooming)>0){
+    for(row in 1:nrow(individuals_grooming)){
+      individuals_grooming_sub <- individuals_grooming[row,]
+      if(!(individuals_grooming_sub$ID == individuals_grooming_sub$PartnerID)){
+        combinations[(combinations$From==individuals_grooming_sub$ID) & (combinations$To==individuals_grooming_sub$PartnerID),]$weight <- 1
+      }
+    }}
+  
+  return(combinations)
+  
+}
+
+get_past_structures_para <- function(df.past.scans, y_values){
+  
+  #data
+  all_xvals <- data.frame()
+  
+  #grooming
+  g.groom.rbm <- get_network_from_scan(df.past.scans, act='Allo-Groomer', troop="RBM")
+  
+  #for each dyad add info (could make this faster...)
+  for (row in 1:nrow(y_values) ){
+    
+    xvals <- data.frame(Troop=NA,past_weight=NA,past_reciprical=NA,past_in_aggro=NA,past_transitive=NA, past_transitive_aggro=NA, past_in_modu=NA, past_overall_modu=NA)
+    
+    #get dyad
+    dyad <- y_values[row,]
+    
+    my_dyad_gnet = g.groom.rbm
+    
+    #### Immediate measures
+    
+    #add dyad measures
+    xvals$past_weight <- get_past_out_grooming(dyad,my_dyad_gnet) #get_past_weight
+    
+    #add reciprical measures
+    xvals$past_reciprical <- get_past_in_grooming(dyad,my_dyad_gnet) #get_past_reciprical
+    
+    #### Local measures
+    
+    #add in local transitive closure
+    xvals$past_transitive <- get_past_trans_grooming(dyad,my_dyad_gnet) 
+    
+    ##### Global measures
+    
+    #add in if partner is within their module
+    xvals$past_in_modu <- get_past_in_community(dyad,my_dyad_gnet)
+    
+    #add in if partner is within their module
+    xvals$past_overall_modu <- get_past_overall_module(my_dyad_gnet)
+    
+    #store the xvals
+    all_xvals <- bind_rows(all_xvals, xvals)
+  }
+  
+  return (all_xvals)
+}
+
+
+```
+
+
+
+### 1.3) Run all the models
+```{r}
+#run the models
+
+run_models <- function(df){
+  
+  #what to record
+  params_of_interest <- c("intercept","b_weight","b_reci","b_trans")
+  
+  #simple mlm
+  fit.simple.structure <- brm(weight ~ past_weight + past_reciprical + past_transitive + (1|To) + (1|From) + (1|dyad_ordered), data = df , cores=4, chains=4, iter=200, prior=prior("normal(0,1)", class="b"),family="bernoulli")
+  
+  samples <- as_draws_df(fit.simple.structure, variable = c("b_Intercept","b_past_weight","b_past_reciprical","b_past_transitive")  )
+  samples_df_MLM <- as.data.frame(samples)[,1:4]
+  colnames(samples_df_MLM) <- c("intercept","b_weight","b_reci","b_trans")
+  samples_df_MLM$model<-"MLM"
+  
+  
+  #prepare the data for stan models
+  data_stan <-list(n_nodes = length(unique(c(df$To, df$From))),
+                   N = nrow(df),
+                   sender_id = df$From,
+                   receiver_id = df$To,
+                   Y = pmin(df$weight,1),
+                   past_weight = df$past_weight, 
+                   past_reci = df$past_reciprical, 
+                   past_trans = df$past_transitive,
+                   past_in_modu = df$past_in_modu,
+                   past_overall_modu = df$past_overall_modu,
+                   send_receive = df$sr_indicator,
+                   dyad_id = df$dyad,
+                   n_dyads = length(unique(df$dyad)),
+                   K=2
+  )
+  
+  #fit the bison model
+  BISON_fit_structure <- stan(file = "amen_SIM_DATA_full_BISON.stan", data = data_stan, iter = 200, chains = 4, cores=4)
+  
+  samples <- extract(BISON_fit_structure, pars = params_of_interest, permuted = TRUE)
+  samples_df_BISON <- as.data.frame(samples)
+  samples_df_BISON$model<-"BISON"
+  
+  
+  BISON_SRM_fit_structure <- stan(file = "amen_SIM_DATA_full_BISONSRM.stan", data = data_stan, iter = 200, chains = 4, cores=4)
+  
+  samples <- extract(BISON_SRM_fit_structure, pars = params_of_interest, permuted = TRUE)
+  samples_df_BISON_SRM <- as.data.frame(samples)
+  samples_df_BISON_SRM$model<-"BISON SRM"
+  
+  
+  #fit the AMEN model
+  amen_fit_test_k2_structure <- stan(file = "amen_SIM_DATA_full.stan", data = data_stan, iter = 200, chains = 4, cores=4 , control=list(adapt_delta=0.95) )
+  
+  samples <- extract(amen_fit_test_k2_structure, pars = params_of_interest, permuted = TRUE)
+  samples_df_AMEN <- as.data.frame(samples)
+  samples_df_AMEN$model<-"AMEN"
+  
+  #fit the AMEN model with penalty
+  amen_fit_test_penalty_structure <- stan(file = "amen_SIM_DATA_full_effectAdjust.stan", data = data_stan,  iter = 200,  chains = 4, cores=4 , control=list(adapt_delta=0.95) )
+  
+  samples <- extract(amen_fit_test_penalty_structure, pars = params_of_interest, permuted = TRUE)
+  samples_df_PEN <- as.data.frame(samples)
+  samples_df_PEN$model<-"AMEN_Penalty"
+  
+  df_res <-bind_rows(samples_df_MLM,samples_df_BISON,samples_df_BISON_SRM,samples_df_AMEN,samples_df_PEN)
+  
+  return(df_res)
+}
+
+
+```
+
+
+# 2) Static
+
+
+Ploting and permutations of the observed network (assuming no uncertainty)
+
+```{r}
+#setup for netTS
+df_all_sim_net<-df_temp %>% dplyr::select(From, To, Date, weight)
+df_all_sim_net <- df_all_sim_net %>% filter(weight>0)
+
+g <- igraph::graph_from_data_frame(df_all_sim_net)
+
+g<-simplify(g, remove.multiple = TRUE,
+            remove.loops = TRUE,
+            edge.attr.comb = igraph_opt("edge.attr.comb"))
+
+plot(g)
+
+transitivity(g)
+trans_perm<-perm.events(df_all_sim_net, transitivity, directed=T, nperm=1000, windowstart = ymd("2000-01-01"), windowend = ymd("2022-01-01") )
+paste0("trans: ", transitivity(g), "  95%CI", round(trans_perm[1],2), "-", round(trans_perm[2],2))
+
+reciprocity(g)
+reci_perm<-perm.events(df_all_sim_net, reciprocity, directed=T, nperm=1000, windowstart = ymd("2000-01-01"), windowend = ymd("2022-01-01") )
+paste0("reciprocity: ", reciprocity(g), "  95%CI", round(reci_perm[1],2), "-", round(reci_perm[2],2))
+```
+
+### Run the test of reciprocity and transitivity permutations many times
+```{r}
+library(netTS)
+df_perm_tests <- data.frame()
+for (run in 1:100){
+  
+  #simulate data
+  df_temp<-sim_data_long(nsim=100,
+                         eff_groom_out=4,
+                         eff_groom_in=0,
+                         eff_groom_trans=0,
+                         eff_spatial=0.1)
+  
+  #Get aggregated network
+  df_all_sim_net<-df_temp %>% dplyr::select(From, To, Date, weight)
+  df_all_sim_net <- df_all_sim_net %>% filter(weight>0)
+  g <- igraph::graph_from_data_frame(df_all_sim_net)
+  g<-simplify(g, remove.multiple = TRUE,  remove.loops = TRUE,  edge.attr.comb = igraph_opt("edge.attr.comb"))
+  
+  #get measures and perms
+  obs_tran <- transitivity(g)
+  trans_perm<-perm.events(df_all_sim_net, transitivity, directed=T, nperm=1000, windowstart = ymd("2000-01-01"), windowend = ymd("2022-01-01") )
+  
+  obs_recip<-reciprocity(g)
+  reci_perm<-perm.events(df_all_sim_net, reciprocity, directed=T, nperm=1000, windowstart = ymd("2000-01-01"), windowend = ymd("2022-01-01") )
+  
+  #keep all the info
+  df_perm_tests <- bind_rows(df_perm_tests, data.frame(recip = obs_recip, recip_low = reci_perm[1], recip_high = reci_perm[2], trans = obs_tran, trans_low=trans_perm[1], trans_high=trans_perm[2]) )
+  
+  
+}
+
+
+df_perm_tests <- df_perm_tests %>% mutate(recip_is_within_ci = recip >= recip_low & recip <= recip_high) %>%  mutate(trans_is_within_ci = trans >= trans_low & trans <= trans_high)
+df_perm_tests
+
+1-sum(df_perm_tests$recip_is_within_ci)/nrow(df_perm_tests)
+1-sum(df_perm_tests$trans_is_within_ci)/nrow(df_perm_tests)
+```
+
+
+
+
+```{r}
+
+plot(g, edge.width= E(g)$weight/10, edge.arrow.width=0.9, edge.arrow.size=0.5)
+library(igraph)
+
+# Step 1: Detect communities using the Walktrap algorithm
+walktrap_comm <- cluster_walktrap(g, weights = E(g)$weight)
+
+# Step 2: Assign colors to each community
+V(g)$color <- membership(walktrap_comm)  # Community memberships
+
+# Normalize the colors to a set of visually distinct colors
+colors <- rainbow(length(unique(membership(walktrap_comm))))  # Assign distinct colors
+V(g)$color <- colors[V(g)$color]  # Map the community memberships to colors
+
+# Step 3: Plot the graph with communities
+# Set the plotting layout to have 2 plots (2 rows, 1 column)
+par(mfrow = c(2, 1))
+
+# Step 1: Remove margins for the graph plot
+par(mar = c(0, 0, 0, 0))  # Remove all margins (bottom, left, top, right)
+plot(g, 
+     edge.width = E(g)$weight / 10, 
+     edge.arrow.width = 0.9, 
+     edge.arrow.size = 0.5,
+     vertex.color = V(g)$color)            # Optionally hide labels for clarity
+
+# Step 2: Plot the dendrogram of the communities with default margins
+par(mar = c(5, 4, 4, 2) + 0.1)  # Reset to default margins (optional)
+plot_dendrogram(walktrap_comm)
+
+
+
+```
+### Build a model and take a posterior prediction approach
+
+
+#### sim data
+
+```{r}
+#simulate data
+df_temp<-sim_data_long(nsim=100,
+                       eff_groom_out=4,
+                       eff_groom_in=0,
+                       eff_groom_trans=0,
+                       eff_spatial=0.1)
+
+df_temp_static <- df_temp
+df_temp_static$sr_indicator <- ifelse(df_temp_static$From < df_temp_static$To, 1,2)
+
+df_temp_static$dyad <- ifelse(df_temp_static$From < df_temp_static$To, 
+                              paste0(df_temp_static$From,"_",df_temp_static$To) ,
+                              paste0(df_temp_static$To,"_",df_temp_static$From))
+
+df_temp_static$dyad <- as.numeric(as.factor(df_temp_static$dyad))
+```
+
+
+```{r}
+#dyadID to dyad converted
+df_dyad_id_converter <- df_temp_static %>% select(From,To,dyad,sr_indicator)
+df_dyad_id_converter$group <- paste0(df_temp_static$dyad,"_",df_temp_static$sr_indicator)
+df_dyad_id_converter <- df_dyad_id_converter %>% distinct()
+df_dyad_id_converter$dyad_back <- df_dyad_id_converter$dyad
+df_dyad_id_converter$dyad <- df_dyad_id_converter$group
+```
+
+```{r}
+#plot simulated data
+df_temp_sum <- df_temp_static %>% group_by(dyad) %>% summarise(meanW = mean(weight),from=From[1], to=To[1]) %>% arrange(desc(meanW)) %>% filter(meanW>0)
+
+df_temp_sum <- df_temp_sum%>% select(from,to,meanW)
+colnames(df_temp_sum)[3] <- "weight"
+g_temp <- graph_from_data_frame(df_temp_sum)
+plot(g_temp, edge.width = E(g_temp)$weight*5, edge.arrow.size=0.2 )
+```
+
+
+
+#### MLM - posterior checks
+```{r}
+library(stringr)
+library(mclust)
+
+true_labels <- c(1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3) #we chose these groups in the simulated data code
+
+df_temp_static <- df_temp_static %>% mutate(dyad_sr = paste0(dyad,"_",sr_indicator) )
+
+MLM_fit_structure <- brm(weight ~ (1|To)+(1|From)+(1|dyad_sr), data = df_temp_static, iter = 200, chains = 4, cores=4, family = "bernoulli")
+save(MLM_fit_structure, file="MLM_static_yes_paritalPooling_yesToFrom.RData")
+
+
+samples_df <- as.data.frame(MLM_fit_structure, pars = c("r_dyad_sr"))
+samples_df_To <- as.data.frame(MLM_fit_structure, pars = c("r_To"))
+samples_df_From <- as.data.frame(MLM_fit_structure, pars = c("r_From"))
+samples_df_intercept <- as.data.frame(MLM_fit_structure, pars = c("b_Intercept"))
+
+
+#loop through and create networks, then get the estimated reciprocity and transitivity
+df_mlm_save <- data.frame()
+df_values_mlm_save <- data.frame()
+for(i in 1:100){
+  
+  df_oneRow<-samples_df[i,]
+  intercept = samples_df_intercept$b_Intercept[i]
+  
+  df_oneCol <- melt(df_oneRow)
+  df_oneCol$value <- df_oneCol$value + intercept
+  
+  df_oneCol$dyad <- paste0(as.integer(str_extract(df_oneCol$variable, "(?<=\\[)\\d+")), "_",
+                           as.integer(str_extract(df_oneCol$variable, "(?<=_)\\d+")) )
+  
+  df_oneCol<-left_join(df_oneCol, df_dyad_id_converter, by="dyad")
+  
+  df_oneCol_To <- melt(samples_df_To[i,])
+  colnames(df_oneCol_To) <- c("To_variable", "To_value")
+  df_oneCol_To$To <- as.integer(str_extract(df_oneCol_To$To_variable, "(?<=\\[)\\d+"))
+  df_oneCol<-left_join(df_oneCol, df_oneCol_To, by="To")
+  
+  df_oneCol_From <- melt(samples_df_From[i,])
+  colnames(df_oneCol_From) <- c("From_variable", "From_value")
+  df_oneCol_From$From <- as.integer(str_extract(df_oneCol_From$From_variable, "(?<=\\[)\\d+"))
+  df_oneCol<-left_join(df_oneCol, df_oneCol_From, by="From")
+  
+  df_oneCol$value <- df_oneCol$value + df_oneCol$To_value + df_oneCol$From_value
+  
+  
+  df_values_mlm_save <- bind_rows(df_values_mlm_save, data.frame(t(df_oneCol$value)) )
+  
+  
+  #simulate some observations based on the prob of being observed
+  for(s in 1:1){
+    
+    df_oneCol$weight <- sapply(inv_logit_scaled(df_oneCol$value), function(p) rbinom(1, 100, p))
+    df_oneCol$weight1 <- sapply(inv_logit_scaled(df_oneCol$value), function(p) rbinom(1, 1, p))
+    
+    #create network
+    g_post <- graph_from_data_frame(df_oneCol %>% select(From, To, weight) %>% filter(weight>0)) 
+    g_post_1 <- graph_from_data_frame(df_oneCol %>% select(From, To, weight1) %>% filter(weight1>0)) 
+    
+    #plot(g_post, edge.width = E(g_post)$weight/10, edge.arrow.size=0.2)
+    
+    #membership
+    mem<-cluster_walktrap(g_post, weights = E(g_post)$weight)$membership
+    df_temp<- data.frame(vertex = as.integer(V(g_post)$name), mem=mem) %>% arrange(vertex)
+    
+    
+    df_mlm_save <- bind_rows(df_mlm_save, data.frame(reci =reciprocity(g_post_1),
+                                                     trans=transitivity(g_post_1),
+                                                     mod_sim =adjustedRandIndex(true_labels, df_temp$mem),
+                                                     rand=s, sample=i ) )
+  }
+  
+}
+
+
+hist(df_mlm_save$reci)
+hist(df_mlm_save$trans)
+hist(df_mlm_save$mod_sim)
+
+p.hist.mlm <- ggplot(df_mlm_save, aes(mod_sim)) +geom_histogram() + theme_bw() + labs(x="Similarity to true network", y="Count")+ # Set the x-axis breaks from 0 to 1 with increments of 0.1
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1.05)) 
+
+median(df_mlm_save$reci)
+hdi(df_mlm_save$reci)
+median(df_mlm_save$trans)
+hdi(df_mlm_save$trans)
+
+
+
+#Step 0: Choose a network to reproduce
+df_oneCol$weight <- sapply(inv_logit_scaled(df_values_mlm_save[1,]), function(p) rbinom(1, 100, p))
+g_post <- graph_from_data_frame(df_oneCol %>% select(From, To, weight) %>% filter(weight>0)) 
+
+# Step 1: Detect communities using the Walktrap algorithm
+walktrap_comm <- cluster_walktrap(g_post, weights = E(g_post)$weight)
+mem<-cluster_walktrap(g_post, weights = E(g_post)$weight)$membership
+df_temp<- data.frame(vertex = as.integer(V(g_post)$name), mem=mem) %>% arrange(vertex)
+
+# Step 2: Assign colors to each community
+V(g_post)$color <- membership(walktrap_comm)  # Community memberships
+
+# Normalize the colors to a set of visually distinct colors
+colors <- rainbow(length(unique(membership(walktrap_comm))))  # Assign distinct colors
+V(g_post)$color <- colors[V(g_post)$color]  # Map the community memberships to colors
+
+
+library(cowplot)
+library(gridGraphics)
+# Use as_grob to capture the igraph plot as a grob
+igraph_grob_mlm <- as_grob(function() plot(g_post, 
+                                           edge.width = E(g_post)$weight / 100, 
+                                           edge.arrow.width = 0.9, 
+                                           edge.arrow.size = 0.5,
+                                           vertex.color = V(g_post)$color,
+                                           main=paste0("Similarity = ",adjustedRandIndex(true_labels, df_temp$mem)) 
+)) # Optionally hide labels for clarity
+
+
+plot_row_mlm <- cowplot::plot_grid(igraph_grob_mlm, p.hist.mlm, ncol=2, labels = c("e)","f)") )
+plot_row_mlm
+ggsave("plot_mlm_row_yes_partial_pool.png",plot_row_mlm, width=12, height=7)
+
+
+```
+
+
+
+
+#### BISON
+```{r}
+
+
+
+#prepare the data for stan models
+data_stan <-list(n_nodes = length(unique(c(df_temp_static$To, df_temp_static$From))),
+                 N = nrow(df_temp_static),
+                 sender_id = df_temp_static$From,
+                 receiver_id = df_temp_static$To,
+                 Y = pmin(df_temp_static$weight,1),
+                 send_receive = df_temp_static$sr_indicator,
+                 dyad_id = df_temp_static$dyad,
+                 n_dyads = length(unique(df_temp_static$dyad)),
+                 K=2
+)
+
+
+BISON_fit_structure <- stan(file = "amen_SIM_DATA_Bison.stan", data = data_stan, iter = 200, chains = 4, cores=4)
+#save(BISON_fit_structure, file="bison_static.RData")
+#load("bison_static.RData")
+
+
+samples <- extract(BISON_fit_structure, pars = c("intercept","mean_dyads"), permuted = TRUE)
+samples_df <- as.data.frame(samples)
+
+#loop through and create networks, then get the estimated reciprocity and transitivity
+df_bison_save <- data.frame()
+df_values_bison_save <- data.frame()
+for(i in 1:100){
+  
+  df_oneRow<-samples_df[i,]
+  intercept = df_oneRow$intercept
+  df_oneRow <- df_oneRow[,-1]
+  
+  df_oneCol <- melt(df_oneRow)
+  df_oneCol$value <- df_oneCol$value + intercept
+  
+  first_split<-str_split_fixed(df_oneCol$variable, pattern="mean_dyads.", n=2)
+  second_split<-str_split_fixed(first_split[,2], pattern="\\.", n=2) 
+  df_oneCol$dyad<-paste0(second_split[,1],"_",second_split[,2])
+  df_oneCol$sr_indicator<-second_split[,2]
+  
+  df_oneCol<-left_join(df_oneCol, df_dyad_id_converter, by="dyad")
+  
+  df_values_bison_save <- bind_rows(df_values_bison_save, data.frame(t(df_oneCol$value)) )
+  
+  
+  #simulate some observations based on the prob of being observed
+  for(s in 1:1){
+    
+    df_oneCol$weight <- sapply(inv_logit_scaled(df_oneCol$value), function(p) rbinom(1, 100, p))
+    df_oneCol$weight1 <- sapply(inv_logit_scaled(df_oneCol$value), function(p) rbinom(1, 1, p))
+    
+    #create network
+    g_post <- graph_from_data_frame(df_oneCol %>% select(From, To, weight) %>% filter(weight>0)) 
+    g_post_1 <- graph_from_data_frame(df_oneCol %>% select(From, To, weight1) %>% filter(weight1>0)) 
+    
+    #plot(g_post, edge.width = E(g_post)$weight/10, edge.arrow.size=0.2)
+    
+    #membership
+    mem<-cluster_walktrap(g_post, weights = E(g_post)$weight)$membership
+    df_temp<- data.frame(vertex = as.integer(V(g_post)$name), mem=mem) %>% arrange(vertex)
+    
+    df_bison_save <- bind_rows(df_bison_save, data.frame(reci =reciprocity(g_post_1),
+                                                         trans=transitivity(g_post_1),
+                                                         mod_sim =adjustedRandIndex(true_labels, df_temp$mem),
+                                                         rand=s, sample=i ) )
+  }
+  
+}
+
+hist(df_bison_save$reci)
+hist(df_bison_save$trans)
+hist(df_bison_save$mod_sim)
+
+p.hist.bison <- ggplot(df_bison_save, aes(mod_sim)) +geom_histogram() + xlim(0,1.2) + theme_bw() + labs(x="Similarity to true network", y="Count") + # Set the x-axis breaks from 0 to 1 with increments of 0.1
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1.05)) 
+
+median(df_bison_save$reci)
+hdi(df_bison_save$reci)
+median(df_bison_save$trans)
+hdi(df_bison_save$trans)
+
+#Step 0: Choose a network to reproduce
+df_oneCol$weight <- sapply(inv_logit_scaled(df_values_bison_save[3,]), function(p) rbinom(1, 100, p))
+g_post <- graph_from_data_frame(df_oneCol %>% select(From, To, weight) %>% filter(weight>0)) 
+
+# Step 1: Detect communities using the Walktrap algorithm
+walktrap_comm <- cluster_walktrap(g_post, weights = E(g_post)$weight)
+mem<-cluster_walktrap(g_post, weights = E(g_post)$weight)$membership
+df_temp<- data.frame(vertex = as.integer(V(g_post)$name), mem=mem) %>% arrange(vertex)
+
+# Step 2: Assign colors to each community
+V(g_post)$color <- membership(walktrap_comm)  # Community memberships
+
+# Normalize the colors to a set of visually distinct colors
+colors <- rainbow(length(unique(membership(walktrap_comm))))  # Assign distinct colors
+V(g_post)$color <- colors[V(g_post)$color]  # Map the community memberships to colors
+
+
+plot(g_post, 
+     edge.width = E(g_post)$weight / 100, 
+     edge.arrow.width = 0.9, 
+     edge.arrow.size = 0.5,
+     vertex.color = V(g_post)$color,
+     main=paste0("Similarity = ",adjustedRandIndex(true_labels, df_temp$mem)) )
+
+
+library(cowplot)
+library(gridGraphics)
+# Use as_grob to capture the igraph plot as a grob
+igraph_grob_bison <- as_grob(function() plot(g_post, 
+                                             edge.width = E(g_post)$weight / 100, 
+                                             edge.arrow.width = 0.9, 
+                                             edge.arrow.size = 0.5,
+                                             vertex.color = V(g_post)$color,
+                                             main=paste0("Similarity = ",adjustedRandIndex(true_labels, df_temp$mem)) 
+)) # Optionally hide labels for clarity
+
+
+plot_row_bison <- cowplot::plot_grid(igraph_grob_bison, p.hist.bison, ncol=2, labels = c("e)","f)") )
+plot_row_bison
+ggsave("plot_bison_row.png",plot_row_bison, width=12, height=7)
+
+
+```
+
+
+
+#### BISON SRM
+```{r}
+#prepare the data for stan models
+data_stan <-list(n_nodes = length(unique(c(df_temp_static$To, df_temp_static$From))),
+                 N = nrow(df_temp_static),
+                 sender_id = df_temp_static$From,
+                 receiver_id = df_temp_static$To,
+                 Y = pmin(df_temp_static$weight,1),
+                 send_receive = df_temp_static$sr_indicator,
+                 dyad_id = df_temp_static$dyad,
+                 n_dyads = length(unique(df_temp_static$dyad)),
+                 K=2
+)
+
+BISON_fit_structure_SRM <- stan(file = "amen_SIM_DATA_BisonSRM.stan", data = data_stan, iter = 200, chains = 4, cores=4)
+save(BISON_fit_structure_SRM, file="bison_SRM_static.RData")
+#load("bison_SRM_static.RData")
+
+samples <- extract(BISON_fit_structure_SRM, pars = c("intercept","mean_dyads","mean_nodes"), permuted = TRUE)
+samples_df <- as.data.frame(samples)
+
+#loop through and create networks, then get the estimated reciprocity and transitivity
+df_bison_SRM_save <- data.frame()
+df_values_bison_SRM_save <- data.frame()
+for(i in 1:100){
+  
+  df_oneRow<-samples_df[i,]
+  intercept = df_oneRow$intercept
+  df_oneRow <- df_oneRow[,-1]
+  
+  df_oneRow_nodes <- df_oneRow %>% select(contains("nodes") )
+  df_oneRow <- df_oneRow %>% select(!contains("nodes") )
+  
+  #add intercept to mean dyad estimates
+  df_oneCol <- melt(df_oneRow)
+  df_oneCol$value <- df_oneCol$value + intercept
+  
+  first_split<-str_split_fixed(df_oneCol$variable, pattern="mean_dyads.", n=2)
+  second_split<-str_split_fixed(first_split[,2], pattern="\\.", n=2) 
+  df_oneCol$dyad<-paste0(second_split[,1],"_",second_split[,2])
+  df_oneCol$sr_indicator<-second_split[,2]
+  
+  df_oneCol<-left_join(df_oneCol, df_dyad_id_converter, by="dyad")
+  
+  #add mean nodes to mean dyad estimates
+  cols_with_dot1 <- grep("\\.1$", colnames(df_oneRow_nodes), value = TRUE)
+  df_oneRow_nodes_sender <- df_oneRow_nodes %>% select(all_of(cols_with_dot1))
+  # Find columns that end with ".2"
+  cols_with_dot2 <- grep("\\.2$", colnames(df_oneRow_nodes), value = TRUE)
+  df_oneRow_nodes_receiver <- df_oneRow_nodes %>% select(all_of(cols_with_dot2))
+  
+  df_oneRow_nodes_sender <- melt(df_oneRow_nodes_sender)
+  df_oneRow_nodes_receiver <- melt(df_oneRow_nodes_receiver)
+  
+  for(d in 1:nrow(df_oneCol) ){
+    
+    df_oneCol[d,]$value <- df_oneCol[d,]$value + df_oneRow_nodes_sender[df_oneCol[d,]$From,]$value + df_oneRow_nodes_receiver[df_oneCol[d,]$To,]$value
+  }
+  
+  df_values_bison_SRM_save <- bind_rows(df_values_bison_SRM_save, data.frame(t(df_oneCol$value)) )
+  
+  #simulate some observations based on the prob of being observed
+  for(s in 1:1){
+    
+    df_oneCol$weight <- sapply(inv_logit_scaled(df_oneCol$value), function(p) rbinom(1, 100, p))
+    df_oneCol$weight1 <- sapply(inv_logit_scaled(df_oneCol$value), function(p) rbinom(1, 1, p))
+    
+    #create network
+    g_post <- graph_from_data_frame(df_oneCol %>% select(From, To, weight) %>% filter(weight>0)) 
+    g_post_1 <- graph_from_data_frame(df_oneCol %>% select(From, To, weight1) %>% filter(weight1>0)) 
+    
+    #plot(g_post, edge.width = E(g_post)$weight, edge.arrow.size=0.2)
+    
+    #membership
+    mem<-cluster_walktrap(g_post, weights = E(g_post)$weight)$membership
+    df_temp<- data.frame(vertex = as.integer(V(g_post)$name), mem=mem) %>% arrange(vertex)
+    
+    
+    df_bison_SRM_save <- bind_rows(df_bison_SRM_save, data.frame(reci =reciprocity(g_post_1), trans=transitivity(g_post_1),mod_sim =adjustedRandIndex(true_labels, df_temp$mem), rand=s, sample=i ) )
+    
+    
+  }
+  
+}
+
+hist(df_bison_SRM_save$reci)
+hist(df_bison_SRM_save$trans)
+hist(df_bison_SRM_save$mod_sim)
+
+p.hist.bisonSRM <- ggplot(df_bison_SRM_save, aes(mod_sim)) +geom_histogram() + xlim(-200,-30) + theme_bw() + labs(x="Similarity to true network", y="Count")+ # Set the x-axis breaks from 0 to 1 with increments of 0.1
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1.05)) 
+
+median(df_bison_SRM_save$reci)
+hdi(df_bison_SRM_save$reci)
+median(df_bison_SRM_save$trans)
+hdi(df_bison_SRM_save$trans)
+
+#Step 0: Choose a network to reproduce
+df_oneCol$weight <- sapply(inv_logit_scaled(df_values_bison_SRM_save[3,]), function(p) rbinom(1, 100, p))
+g_post <- graph_from_data_frame(df_oneCol %>% select(From, To, weight) %>% filter(weight>0)) 
+
+# Step 1: Detect communities using the Walktrap algorithm
+walktrap_comm <- cluster_walktrap(g_post, weights = E(g_post)$weight)
+mem<-cluster_walktrap(g_post, weights = E(g_post)$weight)$membership
+df_temp<- data.frame(vertex = as.integer(V(g_post)$name), mem=mem) %>% arrange(vertex)
+
+# Step 2: Assign colors to each community
+V(g_post)$color <- membership(walktrap_comm)  # Community memberships
+
+# Normalize the colors to a set of visually distinct colors
+colors <- rainbow(length(unique(membership(walktrap_comm))))  # Assign distinct colors
+V(g_post)$color <- colors[V(g_post)$color]  # Map the community memberships to colors
+
+
+library(cowplot)
+library(gridGraphics)
+# Use as_grob to capture the igraph plot as a grob
+igraph_grob_bisonSRM <- as_grob(function() plot(g_post, 
+                                                edge.width = E(g_post)$weight / 100, 
+                                                edge.arrow.width = 0.9, 
+                                                edge.arrow.size = 0.5,
+                                                vertex.color = V(g_post)$color,
+                                                main=paste0("Similarity = ",adjustedRandIndex(true_labels, df_temp$mem)) 
+)) # Optionally hide labels for clarity
+
+
+plot_row_bisonSRM <- cowplot::plot_grid(igraph_grob_bisonSRM, p.hist.bisonSRM, ncol=2, labels = c("e)","f)") )
+plot_row_bisonSRM
+ggsave("plot_bisonSRM_row.png",plot_row_bisonSRM, width=12, height=7)
+
+```
+
+#### AMEN
+```{r}
+#prepare the data for stan models
+data_stan <-list(n_nodes = length(unique(c(df_temp_static$To, df_temp_static$From))),
+                 N = nrow(df_temp_static),
+                 sender_id = df_temp_static$From,
+                 receiver_id = df_temp_static$To,
+                 Y = pmin(df_temp_static$weight,1),
+                 send_receive = df_temp_static$sr_indicator,
+                 dyad_id = df_temp_static$dyad,
+                 n_dyads = length(unique(df_temp_static$dyad)),
+                 K=2
+)
+
+#fit the AMEN model
+amen_fit_test_k2_structure <- stan(file = "amen_SIM_DATA_static.stan", data = data_stan, iter = 2000, chains = 4, cores=4 , control=list(adapt_delta=0.95) )
+#save(amen_fit_test_k2_structure, file="amen_static_2000.RData")
+#load("amen_static.RData")
+print(amen_fit_test_k2_structure, pars = c("intercept","mean_dyads"))
+
+samples <- extract(amen_fit_test_k2_structure, pars = c("intercept","mean_dyads","mean_nodes","mean_multi_effects"), permuted = TRUE)
+samples_df <- as.data.frame(samples)
+
+#loop through and create networks, then get the estimated reciprocity and transitivity
+df_bison_AMEN_save <- data.frame()
+df_values_bison_AMEN_save <- data.frame()
+for(i in 1:100){
+  
+  df_oneRow<-samples_df[i,]
+  intercept = df_oneRow$intercept
+  df_oneRow <- df_oneRow[,-1]
+  
+  df_oneRow_nodes <- df_oneRow %>% select(contains("nodes") )
+  df_oneRow_factors <- df_oneRow %>% select(contains("effects") )
+  df_oneRow <- df_oneRow %>% select(contains("dyads") )
+  
+  ###########################################
+  #add intercept to mean dyad estimates
+  df_oneCol <- melt(df_oneRow)
+  
+  first_split<-str_split_fixed(df_oneCol$variable, pattern="mean_dyads.", n=2)
+  second_split<-str_split_fixed(first_split[,2], pattern="\\.", n=2) 
+  df_oneCol$dyad<-paste0(second_split[,1],"_",second_split[,2])
+  
+  df_oneCol<-left_join(df_oneCol, df_dyad_id_converter, by="dyad")
+  
+  ############################################
+  #add mean nodes to mean dyad estimates
+  cols_with_dot1 <- grep("\\.1$", colnames(df_oneRow_nodes), value = TRUE)
+  df_oneRow_nodes_sender <- df_oneRow_nodes %>% select(all_of(cols_with_dot1))
+  # Find columns that end with ".2"
+  cols_with_dot2 <- grep("\\.2$", colnames(df_oneRow_nodes), value = TRUE)
+  df_oneRow_nodes_receiver <- df_oneRow_nodes %>% select(all_of(cols_with_dot2))
+  
+  df_oneRow_nodes_sender <- melt(df_oneRow_nodes_sender)
+  df_oneRow_nodes_receiver <- melt(df_oneRow_nodes_receiver)
+  
+  
+  ############################################
+  #add mean multiEffects to mean dyad estimates
+  cols_with_dot1 <- grep("\\.1$", colnames(df_oneRow_factors), value = TRUE)
+  df_oneRow_effects_1 <- df_oneRow_factors %>% select(all_of(cols_with_dot1))
+  # Find columns that end with ".2"
+  cols_with_dot2 <- grep("\\.2$", colnames(df_oneRow_factors), value = TRUE)
+  df_oneRow_effects_2 <- df_oneRow_factors %>% select(all_of(cols_with_dot2))
+  # Find columns that end with ".3"
+  cols_with_dot3 <- grep("\\.3$", colnames(df_oneRow_factors), value = TRUE)
+  df_oneRow_effects_3 <- df_oneRow_factors %>% select(all_of(cols_with_dot3))
+  # Find columns that end with ".4"
+  cols_with_dot4 <- grep("\\.4$", colnames(df_oneRow_factors), value = TRUE)
+  df_oneRow_effects_4 <- df_oneRow_factors %>% select(all_of(cols_with_dot4))
+  
+  df_oneRow_effects_1 <- melt(df_oneRow_effects_1)
+  df_oneRow_effects_2 <- melt(df_oneRow_effects_2)
+  df_oneRow_effects_3 <- melt(df_oneRow_effects_3)
+  df_oneRow_effects_4 <- melt(df_oneRow_effects_4)
+  
+  
+  ############################################
+  #add all effects to the mean value
+  for(d in 1:nrow(df_oneCol) ){
+    
+    df_oneCol[d,]$value <- intercept+ df_oneCol[d,]$value + df_oneRow_nodes_sender[df_oneCol[d,]$From,]$value + df_oneRow_nodes_receiver[df_oneCol[d,]$To,]$value + sum( c(df_oneRow_effects_1[df_oneCol[d,]$From,]$value,df_oneRow_effects_2[df_oneCol[d,]$From,]$value) * c(df_oneRow_effects_3[df_oneCol[d,]$To,]$value,df_oneRow_effects_4[df_oneCol[d,]$To,]$value) )
+  }
+  
+  df_values_bison_AMEN_save <- bind_rows(df_values_bison_AMEN_save, data.frame(t(df_oneCol$value)) )
+  
+  
+  #simulate some observations based on the prob of being observed
+  for(s in 1:1){
+    
+    #df_oneCol$weight<-rbinom(nrow(df_oneCol) , size=1,  prob=inv_logit_scaled(df_oneCol$value) )
+    
+    df_oneCol$weight <- sapply(inv_logit_scaled(df_oneCol$value), function(p) rbinom(1, 100, p))
+    df_oneCol$weight1 <- sapply(inv_logit_scaled(df_oneCol$value), function(p) rbinom(1, 1, p))
+    
+    #create network
+    g_post <- graph_from_data_frame(df_oneCol %>% select(From, To, weight) %>% filter(weight>0)) 
+    g_post_1 <- graph_from_data_frame(df_oneCol %>% select(From, To, weight1) %>% filter(weight1>0)) 
+    #plot(g_post, edge.width = E(g_post)$weight, edge.arrow.size=0.2)
+    
+    #membership
+    mem<-cluster_walktrap(g_post, weights = E(g_post)$weight)$membership
+    df_temp<- data.frame(vertex = as.integer(V(g_post)$name), mem=mem) %>% arrange(vertex)
+    
+    df_bison_AMEN_save <- bind_rows(df_bison_AMEN_save, data.frame(reci =reciprocity(g_post_1), trans=transitivity(g_post_1),mod_sim =adjustedRandIndex(true_labels, df_temp$mem), rand=s, sample=i ) )
+    
+    
+  }
+  
+}
+
+hist(df_bison_AMEN_save$reci)
+hist(df_bison_AMEN_save$trans)
+hist(df_bison_AMEN_save$mod_sim)
+p.hist.amen <- ggplot(df_bison_AMEN_save, aes(mod_sim)) +geom_histogram() + xlim(-200,-30) + theme_bw() + labs(x="Similarity to true network", y="Count")+ # Set the x-axis breaks from 0 to 1 with increments of 0.1
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1.05)) +
+  scale_y_continuous(breaks = seq(0, 90, by = 25), limits = c(0, 95)) 
+
+median(df_bison_AMEN_save$reci)
+hdi(df_bison_AMEN_save$reci)
+median(df_bison_AMEN_save$trans)
+hdi(df_bison_AMEN_save$trans)
+
+
+
+#Step 0: Choose a network to reproduce
+df_oneCol$weight <- sapply(inv_logit_scaled(df_values_bison_AMEN_save[17,]), function(p) rbinom(1, 100, p))
+g_post <- graph_from_data_frame(df_oneCol %>% select(From, To, weight) %>% filter(weight>0)) 
+
+# Step 1: Detect communities using the Walktrap algorithm
+walktrap_comm <- cluster_walktrap(g_post, weights = E(g_post)$weight)
+mem<-cluster_walktrap(g_post, weights = E(g_post)$weight)$membership
+df_temp<- data.frame(vertex = as.integer(V(g_post)$name), mem=mem) %>% arrange(vertex)
+
+# Step 2: Assign colors to each community
+V(g_post)$color <- membership(walktrap_comm)  # Community memberships
+
+# Normalize the colors to a set of visually distinct colors
+colors <- rainbow(length(unique(membership(walktrap_comm))))  # Assign distinct colors
+V(g_post)$color <- colors[V(g_post)$color]  # Map the community memberships to colors
+
+
+#igraph_grob <- cowplot::as_grob(plot_amen_net())
+library(cowplot)
+library(gridGraphics)
+# Use as_grob to capture the igraph plot as a grob
+igraph_grob_amen <- as_grob(function() plot(g_post, 
+                                            edge.width = E(g_post)$weight / 100, 
+                                            edge.arrow.width = 0.9, 
+                                            edge.arrow.size = 0.5,
+                                            vertex.color = V(g_post)$color,
+                                            main=paste0("Similarity = ",adjustedRandIndex(true_labels, df_temp$mem)) 
+)) # Optionally hide labels for clarity
+
+
+plot_row_amen <- cowplot::plot_grid(igraph_grob_amen, p.hist.amen, ncol=2, labels = c("e)","f)") )
+plot_row_amen
+ggsave("plot_amen_row_2000.png",plot_row_amen, width=12, height=7)
+```
+
+
+
+
+# 3) Dynamic
+
+#### No influence on grooming
+
+Simulating a dataset where past interactions do not influence future grooming behaviours.
+
+```{r}
+
+df_test_results_zero <- data.frame()
+
+for (run in 1:50){
+  
+  #simulate data
+  df_temp<-sim_data_long(nsim=100,
+                         eff_groom_out=0,
+                         eff_groom_in=0,
+                         eff_groom_trans=0,
+                         eff_spatial=0)
+  
+  #extract past measures
+  df_obs<-extract_past_measures(df_obs=df_temp)
+  
+  #run all the models
+  df_res <- run_models(df=df_obs)
+  
+  #keep all the info
+  df_res$run = run
+  df_test_results_zero <- bind_rows(df_test_results_zero, df_res)
+  
+  save(df_test_results_zero, file="backup_out0_in0_trans0_spat0_oct24.RData")
+}
+
+save(df_test_results_zero, file="backup_out0_in0_trans0_spat0_oct23.RData")
+#load("backup_out0_in0_trans0_spat0_oct23.RData")
+summary(df_test_results_zero$run)
+unique(df_test_results_zero$model)
+```
+
+
+```{r}
+library(reshape2)
+df_test_results_melt <- melt(df_test_results_zero, id.vars = c("run","model")) %>% filter(!variable=="intercept") 
+
+df_test_results_melt$model<-factor(df_test_results_melt$model, levels = c("MLM","BISON","BISON SRM","AMEN","AMEN_Penalty") )
+
+#visualize overall
+ggplot(df_test_results_melt, aes(y=model,x=value,color=variable)) + geom_density_ridges() + facet_grid(~variable) + geom_vline(xintercept = 0, linetype="dashed")
+
+
+#visualize the rate of false positive/false negative
+df_test_results_melt$group <- paste0(df_test_results_melt$model,"_",df_test_results_melt$variable,"_",df_test_results_melt$run)
+df_test_results_summa <- df_test_results_melt %>% group_by(group) %>% mutate(mean_est = mean(value), lower=HDInterval::hdi(value)[1], upper=HDInterval::hdi(value)[2] ) %>% dplyr::select(-value,-run) %>% distinct()
+
+df_test_results_summa$zero <- ifelse( (df_test_results_summa$lower<0) &(df_test_results_summa$upper>0), 1, 0  )
+
+arrange(df_test_results_summa, by=group)
+
+df_test_results_summa$group2 <- paste0(df_test_results_summa$model,"_",df_test_results_summa$variable)
+df_test_results_plot<-df_test_results_summa %>% group_by(group2) %>% summarise(zeroIs = mean(zero) , model=model[1], variable=variable[1])
+
+ggplot(df_test_results_plot, aes(x=model, y=zeroIs)) + geom_point() + facet_grid(~variable) + geom_hline(yintercept = 1, color="red") + theme_bw() + labs(y="Parameter is likely zero (% of models run)")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylim(0,1)
+
+```
+
+
+#### Groom_out influences grooming
+
+Simulate a dataset where past grooming-out behaviour influences future grooming behaviour. We assume there are no confounds or unmeasured variables.
+
+```{r}
+
+df_test_results <- data.frame()
+
+for (run in 1:100){
+  
+  #simulate data
+  df_temp<-sim_data_long(nsim=100,
+                         eff_groom_out=4,
+                         eff_groom_in=0,
+                         eff_groom_trans=0,
+                         eff_spatial=0)
+  
+  #extract past measures
+  df_obs<-extract_past_measures(df_obs=df_temp)
+  
+  #run all the models
+  df_res <- run_models(df=df_obs)
+  
+  #keep all the info
+  df_res$run = run
+  df_test_results_noCon <- bind_rows(df_test_results_noCon, df_res)
+  
+  save(df_test_results_noCon, file="backup_out4_in0_trans0_spat0_oct23.RData")
+}
+
+save(df_test_results_noCon, file="backup_out4_in0_trans0_spat0_oct23.RData")
+
+summary(df_test_results_noCon$run)
+
+```
+
+
+```{r}
+library(reshape2)
+df_test_results_melt <- melt(df_test_results_noCon %>% filter(run<62), id.vars = c("run","model")) %>% filter(!variable=="intercept") 
+
+df_test_results_melt$model<-factor(df_test_results_melt$model, levels = c("MLM","BISON","BISON SRM","AMEN","AMEN_Penalty") )
+
+#visualize overall
+ggplot(df_test_results_melt, aes(y=model,x=value,color=variable)) + geom_density_ridges() + facet_grid(~variable) + geom_vline(xintercept = 0, linetype="dashed")
+
+
+#visualize the rate of false positive/false negative
+df_test_results_melt$group <- paste0(df_test_results_melt$model,"_",df_test_results_melt$variable,"_",df_test_results_melt$run)
+df_test_results_summa <- df_test_results_melt %>% group_by(group) %>% mutate(mean_est = mean(value), lower=HDInterval::hdi(value)[1], upper=HDInterval::hdi(value)[2] ) %>% dplyr::select(-value,-run) %>% distinct()
+
+df_test_results_summa$zero <- ifelse( (df_test_results_summa$lower<0) &(df_test_results_summa$upper>0), 1, 0  )
+
+arrange(df_test_results_summa, by=group)
+
+df_test_results_summa$group2 <- paste0(df_test_results_summa$model,"_",df_test_results_summa$variable)
+df_test_results_zero<-df_test_results_summa %>% group_by(group2) %>% summarise(zeroIs = mean(zero) , model=model[1], variable=variable[1])
+
+ggplot(df_test_results_zero, aes(x=model, y=zeroIs)) + geom_point() + facet_grid(~variable)+
+  geom_hline(aes(yintercept = ifelse(parameter == "out-grooming", 0, 1)), color = "red") + theme_bw() + labs(y="Parameter is likely zero (% of models run)")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+#### Groom_out & confound influence grooming:
+
+Simulate a dataset where past grooming-out behaviour influences future grooming behaviour. We assume there is a confound or some unmeasured variables.
+
+Model fits
+
+```{r}
+
+for (run in 73:100){
+  
+  #simulate data
+  df_temp<-sim_data_long(nsim=100,
+                         eff_groom_out=4,
+                         eff_groom_in=0,
+                         eff_groom_trans=0,
+                         eff_spatial=0.1)
+  
+  #extract past measures
+  df_obs<-extract_past_measures(df_obs=df_temp)
+  
+  #run all the models
+  df_res <- run_models(df=df_obs)
+  
+  #keep all the info
+  df_res$run = run
+  df_test_results_spatial <- bind_rows(df_test_results_spatial, df_res)
+  
+  print(paste0("done! ",run))
+  
+  save(df_test_results_spatial, file="MS_Oct18.RData")
+  
+  
+}
+
+#load(file="MS_Oct18.RData")
+summary(df_test_results_spatial$run)
+unique(df_test_results_spatial$model)
+```
+
+
+
+```{r}
+library(reshape2)
+library(ggridges)
+df_test_results_melt <- melt(df_test_results_spatial, id.vars = c("run","model")) %>% filter(!variable=="intercept") 
+
+df_test_results_melt <- df_test_results_melt %>% mutate(model = recode(model, "AMEN_Penalty" = "RAMEN"))
+
+df_test_results_melt$model<-factor(df_test_results_melt$model, levels = c("MLM","BISON","BISON SRM","AMEN","RAMEN") )
+
+#visualize overall
+ggplot(df_test_results_melt, aes(y=model,x=value,color=variable)) + geom_density_ridges() + facet_grid(~variable) + geom_vline(xintercept = 0, linetype="dashed")
+
+
+#visualize the rate of false positive/false negative
+df_test_results_melt$group <- paste0(df_test_results_melt$model,"_",df_test_results_melt$variable,"_",df_test_results_melt$run)
+df_test_results_summa <- df_test_results_melt %>% group_by(group) %>% mutate(mean_est = mean(value), lower=HDInterval::hdi(value)[1], upper=HDInterval::hdi(value)[2] ) %>% dplyr::select(-value,-run) %>% distinct()
+
+df_test_results_summa$zero <- ifelse( (df_test_results_summa$lower<0) &(df_test_results_summa$upper>0), 1, 0  )
+
+arrange(df_test_results_summa, by=group)
+
+df_test_results_summa$group2 <- paste0(df_test_results_summa$model,"_",df_test_results_summa$variable)
+df_test_results_zero<-df_test_results_summa %>% group_by(group2) %>% summarise(zeroIs = mean(zero) , model=model[1], variable=variable[1])
+
+df_test_results_zero <- df_test_results_zero %>% mutate(parameter = recode(variable, b_reci= "reciprocity", b_trans = "transitivity", b_weight = "out-grooming") )
+
+ggplot(df_test_results_zero, aes(x=model, y=zeroIs)) + geom_point() + facet_grid(~parameter) +
+  geom_hline(aes(yintercept = ifelse(parameter == "out-grooming", 0, 1)), color = "red") + theme_bw() + labs(y="Parameter is likely zero (% of models run)")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+df_test_results_zero$wrong <- 1-df_test_results_zero$zeroIs
+df_test_results_zero
+```
+
+
+
+# 4) Dynamic Observed data
+
+Assume no uncertainty and look at dynamic patterns in networks thru time.
+
+Visualize the data through time: graph level
+```{r}
+library(netTS)
+library(lubridate)
+
+#setup for netTS
+df_all_sim_net<-df_temp %>% dplyr::select(From, To, Date, weight)
+df_all_sim_net <- df_all_sim_net %>% filter(weight>0)
+
+g <- igraph::graph_from_data_frame(df_all_sim_net)
+
+trans_mean <- function(g){
+  return(transitivity(g))
+}
+
+reciprocity_mean <- function(g){
+  return(reciprocity(g))
+}
+
+reciprocity_mean(g)
+
+#extract a graph level measure
+net.reci<-graphTS(df_all_sim_net, windowsize = days(10), windowshift = days(1), measureFun = reciprocity_mean, directed = T, permutationFun = perm.events, nperm=1000)
+p.reci<-graphTS.plot(net.reci, plotCI = T) + labs(y="reciprocity")
+
+#transitivity
+net.trans<-graphTS(df_all_sim_net, windowsize = days(10), windowshift = days(1), measureFun = trans_mean, permutationFun = perm.events, nperm=1000)
+p.trans<-graphTS.plot(net.trans, plotCI = T)+ labs(y="transitivity")
+
+cowplot::plot_grid(p.reci, p.trans, ncol=1, labels = c("a)","b)"))
+```
+
+
+Run the test of reciprocity and transitivity permutations many times
+```{r}
+library(netTS)
+
+df_perm_tests_dynamic <- data.frame()
+
+progress_bar <- txtProgressBar(min = 0, max = 100, style = 3)
+
+
+for (run in 1:100){
+  
+  #simulate data
+  df_temp<-sim_data_long(nsim=100,
+                         eff_groom_out=4,
+                         eff_groom_in=0,
+                         eff_groom_trans=0,
+                         eff_spatial=0.1)
+  
+  #setup for netTS
+  df_all_sim_net<-df_temp %>% dplyr::select(From, To, Date, weight)
+  df_all_sim_net <- df_all_sim_net %>% filter(weight>0)
+  g <- igraph::graph_from_data_frame(df_all_sim_net)
+  
+  #extract a graph level measure
+  net.reci<-graphTS(df_all_sim_net, windowsize = days(10), windowshift = days(1), measureFun = reciprocity_mean, directed = T, permutationFun = perm.events, nperm=1000)
+  net.reci <- net.reci %>% mutate(recip_is_within_ci = measure >= CI.low & measure <= CI.high)
+  net.reci.outsideCI <- 1-sum(net.reci$recip_is_within_ci)/nrow(net.reci)
+  
+  #transitivity
+  net.trans<-graphTS(df_all_sim_net, windowsize = days(10), windowshift = days(1), measureFun = trans_mean, permutationFun = perm.events, nperm=1000)
+  net.trans <- net.trans %>% mutate(trans_is_within_ci = measure >= CI.low & measure <= CI.high)
+  net.trans.outsideCI <- 1-sum(net.trans$trans_is_within_ci)/nrow(net.trans)
+  
+  #keep all the info
+  df_perm_tests_dynamic <- bind_rows(df_perm_tests_dynamic, data.frame(recipOut = net.reci.outsideCI, transOut = net.trans.outsideCI, run=run ))
+  
+  setTxtProgressBar(progress_bar, run)
+  
+  
+}
+
+close(progress_bar)
+
+#plot an example
+cowplot::plot_grid(
+  graphTS.plot(net.reci, plotCI = T)+labs(y="Reciprocity", x="Date"),
+  graphTS.plot(net.trans, plotCI = T)+labs(y="Transitivity", x="Date"),
+  ncol=1
+)
+
+#save(df_perm_tests_dynamic, file="dynamic_perm_tests.RData")
+
+mean(df_perm_tests_dynamic$recipOut)
+hdi(df_perm_tests_dynamic$recipOut)
+
+mean(df_perm_tests_dynamic$transOut)
+hdi(df_perm_tests_dynamic$transOut)
+
+```
+
+
